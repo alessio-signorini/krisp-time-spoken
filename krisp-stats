@@ -1,0 +1,206 @@
+#!/usr/bin/ruby
+# encoding: utf-8
+# krisp-stats — how much each participant talked in a Krisp transcript.
+# Uses only the Ruby that ships with macOS (2.6+) and its standard library.
+
+require 'optparse'
+
+module KrispStats
+  HEADER_RE = /\A(.+?) \| (\d+:\d{2}(?::\d{2})?)\s*\z/
+
+  MIN_WORDS_FOR_RATE = 5     # turns shorter than this are too noisy to measure WPM
+  DEFAULT_WPM        = 150.0 # used when no speaker has a reliable turn
+  CAP_FACTOR         = 1.5   # gap > CAP_FACTOR * expected + CAP_SLACK => treat as silence
+  CAP_SLACK          = 3.0   # seconds
+
+  Turn = Struct.new(:speaker, :start, :words, :gap, :duration, :capped, :estimated)
+  Stat = Struct.new(:name, :seconds, :percent, :words, :turns, :wpm, :capped)
+
+  module_function
+
+  def parse_time(str)
+    str.split(':').map(&:to_i).inject(0) { |acc, n| acc * 60 + n }
+  end
+
+  def count_words(text)
+    text.split(/\s+/).count { |w| w =~ /[[:alnum:]]/ }
+  end
+
+  def parse(text)
+    text = text.dup.force_encoding('UTF-8')
+    text = text.encode('UTF-8', 'binary', invalid: :replace, undef: :replace) unless text.valid_encoding?
+    turns = []
+    text.each_line do |line|
+      line = line.chomp.sub(/\A\uFEFF/, '')
+      if (m = HEADER_RE.match(line))
+        turns << Turn.new(m[1].strip, parse_time(m[2]), 0)
+      elsif turns.any?
+        turns.last.words += count_words(line)
+      end
+    end
+    turns
+  end
+
+  def median(values)
+    return nil if values.empty?
+    s = values.sort
+    mid = s.size / 2
+    s.size.odd? ? s[mid] : (s[mid - 1] + s[mid]) / 2.0
+  end
+
+  # Returns { speaker => words-per-minute }.
+  def speaking_rates(turns)
+    samples = Hash.new { |h, k| h[k] = [] }
+    turns.each do |t|
+      next unless t.gap && t.gap > 0 && t.words >= MIN_WORDS_FOR_RATE
+      samples[t.speaker] << t.words / (t.gap / 60.0)
+    end
+    per_speaker = {}
+    samples.each { |name, rates| per_speaker[name] = median(rates) }
+    fallback = median(samples.values.flatten) || DEFAULT_WPM
+    rates = Hash.new(fallback)
+    turns.each { |t| rates[t.speaker] = per_speaker[t.speaker] || fallback }
+    rates
+  end
+
+  def estimate!(turns)
+    turns.each_with_index do |t, i|
+      nxt = turns[i + 1]
+      t.gap = nxt ? [nxt.start - t.start, 0].max : nil
+    end
+    rates = speaking_rates(turns)
+    turns.each do |t|
+      expected = t.words / rates[t.speaker] * 60.0
+      if t.gap.nil?
+        t.duration = expected
+        t.estimated = true
+      elsif t.gap > CAP_FACTOR * expected + CAP_SLACK
+        t.duration = expected
+        t.capped = true
+      else
+        t.duration = t.gap.to_f
+      end
+    end
+    rates
+  end
+
+  def analyze(text)
+    turns = parse(text)
+    raise ArgumentError, 'no Krisp turns found (expected lines like "Name | 12:34")' if turns.empty?
+    rates = estimate!(turns)
+    total = turns.inject(0.0) { |s, t| s + t.duration }
+    stats = turns.group_by(&:speaker).map do |name, ts|
+      secs = ts.inject(0.0) { |s, t| s + t.duration }
+      Stat.new(name, secs, total > 0 ? secs * 100.0 / total : 0.0,
+               ts.inject(0) { |s, t| s + t.words }, ts.size, rates[name], ts.count(&:capped))
+    end
+    stats.sort_by! { |s| [-s.seconds, s.name] }
+    {
+      stats: stats,
+      turns: turns,
+      total: total,
+      span: turns.last.start + turns.last.duration,
+      capped: turns.count(&:capped),
+    }
+  end
+
+  def fmt_time(seconds)
+    s = seconds.round
+    h, rem = s.divmod(3600)
+    m, sec = rem.divmod(60)
+    h > 0 ? format('%d:%02d:%02d', h, m, sec) : format('%d:%02d', m, sec)
+  end
+
+  BLOCKS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉'].freeze
+
+  def bar(fraction, width)
+    eighths = (fraction * width * 8).round
+    full, part = eighths.divmod(8)
+    '█' * full + BLOCKS[part]
+  end
+
+  def render(result, title: nil, color: false, verbose: false, bar_width: 30)
+    c = lambda { |code, s| color ? "\e[#{code}m#{s}\e[0m" : s }
+    stats = result[:stats]
+    name_w = [stats.map { |s| s.name.length }.max, 11].max
+    time_w = [stats.map { |s| fmt_time(s.seconds).length }.max, 4].max
+    max_pct = stats.map(&:percent).max.to_f
+    palette = [36, 35, 33, 32, 34, 31]
+
+    out = []
+    heading = [title,
+               fmt_time(result[:span]),
+               "#{stats.size} participant#{'s' if stats.size != 1}",
+               "#{result[:turns].size} turns"].compact.join(' · ')
+    out << ''
+    out << '  ' + c.call('1', heading)
+    out << ''
+    head = format("  %-#{name_w}s  %#{time_w}s  %6s", 'Participant', 'Time', 'Share')
+    head += format('  %7s  %5s  %4s', 'Words', 'Turns', 'WPM') if verbose
+    out << c.call('2', head)
+    stats.each_with_index do |s, i|
+      line = '  ' + s.name.ljust(name_w) + '  ' + fmt_time(s.seconds).rjust(time_w) +
+             '  ' + format('%5.1f%%', s.percent)
+      line += format('  %7d  %5d  %4d', s.words, s.turns, s.wpm.round) if verbose
+      width = max_pct > 0 ? s.percent / max_pct : 0
+      line += '  ' + c.call(palette[i % palette.size].to_s, bar(width, bar_width))
+      out << line
+    end
+    out << c.call('2', '  ' + '─' * (name_w + time_w + 10))
+    out << '  ' + 'Total'.ljust(name_w) + '  ' + fmt_time(result[:total]).rjust(time_w) + '  100.0%'
+    if result[:capped] > 0
+      note = "#{result[:capped]} long pause#{'s' if result[:capped] != 1} " \
+             'trimmed to word-based estimates; last turn estimated from word count.'
+      out << '' << c.call('2', '  ' + note)
+    end
+    out << ''
+    out.join("\n")
+  end
+
+  def run(argv, stdin: $stdin, stdout: $stdout, stderr: $stderr)
+    opts = { verbose: false, color: stdout.tty? && ENV['NO_COLOR'].to_s.empty? }
+    parser = OptionParser.new do |o|
+      o.banner = <<~TXT
+        Usage: krisp-stats [options] [TRANSCRIPT...]
+
+        Shows how long each participant talked (time and percentage).
+        With no files, reads stdin if piped, otherwise the clipboard (pbpaste).
+
+      TXT
+      o.on('-v', '--verbose', 'Also show words, turns and words-per-minute') { opts[:verbose] = true }
+      o.on('--no-color', 'Disable colors') { opts[:color] = false }
+      o.on('-h', '--help', 'Show this help') { stdout.puts o; return 0 }
+    end
+    files = parser.parse(argv)
+
+    sources =
+      if files.any?
+        files.map { |f| [f, File.read(f, encoding: 'UTF-8')] }
+      elsif !stdin.tty?
+        [[nil, stdin.read]]
+      else
+        [['clipboard', `pbpaste 2>/dev/null`]]
+      end
+
+    status = 0
+    sources.each do |name, text|
+      begin
+        stdout.puts render(analyze(text), title: name && File.basename(name),
+                                          color: opts[:color], verbose: opts[:verbose])
+      rescue ArgumentError => e
+        stderr.puts "krisp-stats: #{name || 'stdin'}: #{e.message}"
+        status = 1
+      end
+    end
+    status
+  rescue OptionParser::ParseError => e
+    stderr.puts "krisp-stats: #{e.message}"
+    stderr.puts "Try 'krisp-stats --help'."
+    1
+  rescue SystemCallError => e
+    stderr.puts "krisp-stats: #{e.message}"
+    1
+  end
+end
+
+exit KrispStats.run(ARGV) if $PROGRAM_NAME == __FILE__
